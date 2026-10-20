@@ -9,6 +9,8 @@ import threading
 import time
 from ctypes import wintypes
 
+import project_config
+
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 GENERIC_READ = 0x80000000
@@ -112,8 +114,8 @@ class MotionStopped(OSError):
 class MotionLink:
     """COM7 at 115200. DTR and RTS stay off so opening the port does not reset the board."""
 
-    def __init__(self, port: str = "COM7") -> None:
-        self.port = port
+    def __init__(self, port: str | None = None) -> None:
+        self.port = (port or project_config.machine().port).upper()
         self._handle: int | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()

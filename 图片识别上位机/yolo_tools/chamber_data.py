@@ -13,7 +13,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-YOLO_ROOT = Path(r"E:\yolo")
+import project_config
+
+YOLO_ROOT = project_config.machine().yolo_root
 RAW = YOLO_ROOT / "datasets" / "chamber_raw"
 CLS = YOLO_ROOT / "datasets" / "chamber_cls"
 RUNS = YOLO_ROOT / "runs"

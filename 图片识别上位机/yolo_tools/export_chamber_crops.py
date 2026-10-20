@@ -23,12 +23,15 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERE = Path(__file__).resolve().parent
+for folder in (str(ROOT), str(HERE)):
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
 
 from qc_host.vision.frontlight import _analyse_chamber, _locate_chambers, _px  # noqa: E402
+import project_config  # noqa: E402
 
-DEFAULT_OUT = Path(r"E:\yolo\datasets\chamber_raw")
+DEFAULT_OUT = project_config.machine().yolo_root / "datasets" / "chamber_raw"
 TEMPLATE = Path(__file__).with_name("chamber_template.png")
 FOLDERS = {"合格": "hege", "渗墨": "shenmo", "缺墨": "quemo", "不能识别": "buneng", None: "weidingwei"}
 COLORS = {"hege": (80, 210, 80), "shenmo": (40, 40, 220), "quemo": (0, 210, 255), "buneng": (0, 165, 255),

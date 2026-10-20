@@ -19,6 +19,7 @@ import board_views as bv
 import chamber_data as cd
 import export_chamber_crops as ec
 import hole_assist as ha
+import project_config
 
 HERE = Path(__file__).resolve().parent
 DATA = cd.YOLO_ROOT / "datasets" / "chamber_train"
@@ -580,8 +581,10 @@ class TrainModelWindow:
         self._stopped = False
         if weights is not None:
             args += ["--weights", str(weights)]
-        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "TEMP": r"E:\tmp", "TMP": r"E:\tmp"}
-        Path(r"E:\tmp").mkdir(exist_ok=True)
+        temp_dir = project_config.machine().temp_dir
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+               "TEMP": str(temp_dir), "TMP": str(temp_dir)}
         self.app.train_proc = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             env=env, cwd=str(HERE.parent), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

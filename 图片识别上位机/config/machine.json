@@ -1,0 +1,11 @@
+{
+  "active_board": "xbeam",
+  "scan_root": "E:/xiangmu/shibie/qc_motion/scan_yolo",
+  "yolo_root": "E:/yolo",
+  "temp_dir": "E:/tmp",
+  "port": "COM7",
+  "baud": 115200,
+  "px_per_mm": 44.2,
+  "align_offset_mm": 20.0,
+  "unsure_conf": 0.6
+}

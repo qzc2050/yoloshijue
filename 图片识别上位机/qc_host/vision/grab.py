@@ -91,10 +91,15 @@ class CameraSession:
         self._center = 0.0
         self._overall = 0.0
         self._error: str | None = None
+        self._settings: CameraSettings | None = None
 
     @property
     def connected(self) -> bool:
         return self._running
+
+    @property
+    def settings(self) -> CameraSettings | None:
+        return self._settings
 
     def start(self) -> str:
         if self._running:
@@ -187,6 +192,10 @@ class CameraSession:
         finally:
             hc.MvCamera.MV_CC_SetFloatValue = original
         self._camera = camera
+        try:
+            self._settings = _read_settings(camera.cam)
+        except Exception:
+            self._settings = None
         return info
 
     def _loop(self) -> None:

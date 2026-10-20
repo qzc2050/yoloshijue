@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
@@ -18,41 +19,29 @@ HOST = next(p for p in ROOT.iterdir() if (p / "yolo_tools" / "export_chamber_cro
 sys.path.insert(0, str(HOST / "yolo_tools"))
 
 import export_chamber_crops as ec  # noqa: E402
+import project_config as cfg  # noqa: E402
 
-PX_PER_MM = 44.2
-MERGE_MM = 2.5
-MATCH_MM = 3.0
-# Shipped with the program: boards/xbeam holds the factory carbon films (D49 horizontal, D50 vertical).
-BOARD_DIR = HOST / "boards" / "xbeam"
 CJ_MM = 25.4 / 100000.0
-# new (x, y) mm -> machine mm. Along-column direction is reversed. Median residual 0.016 mm
-# on the 284 top horizontals.
-CJ_TO_MACHINE = (
-    (0.035398, -1.000411, 889.381661),
-    (1.000411, 0.035398, -844.766616),
-)
-# Back side is the board turned over along the vertical chambers: machine X and the green
-# circuit stay put, machine Y mirrors about that column. D column's first chamber then
-# sits where the front's first chamber sat.
-SIDES = {
-    "front": {"file": BOARD_DIR / "ty-t.gbr", "expect": 399, "mirror_y": False},
-    "back": {"file": BOARD_DIR / "ty-b.gbr", "expect": 360, "mirror_y": True},
-}
 SCAN = ROOT / "qc_motion" / "scan_line"
-OUT = SCAN / "groups.json"
-DET_CACHE = SCAN / "detections.json"
-POSE = re.compile(r"_x(-?\d+)_y(-?\d+)$")
+POSE = re.compile(r"_x(-?\d+(?:\.\d+)?)_y(-?\d+(?:\.\d+)?)$")
 FLASH = re.compile(r"(?:X(-?\d+))?(?:Y(-?\d+))?D03\*")
 APERTURE = re.compile(r"G54D(\d+)\*")
 
 
-def read_side(folder: Path) -> str:
+def read_board(folder: Path) -> cfg.Board:
+    path = Path(folder) / "board.txt"
+    if path.is_file():
+        return cfg.board(path.read_text(encoding="utf-8").strip().lower())
+    return cfg.board()
+
+
+def read_side(folder: Path, board: cfg.Board) -> str:
     path = Path(folder) / "side.txt"
     if path.is_file():
         text = path.read_text(encoding="utf-8").strip().lower()
-        if text in SIDES:
+        if text in board.sides:
             return text
-    return "front"
+    return next(iter(board.sides))
 
 
 def _cj_flashes(path: Path) -> dict[str, list[tuple[float, float]]]:
@@ -88,21 +77,21 @@ def _dedupe(points: list[tuple[float, float]], tol: float = 0.3) -> list[tuple[f
     return kept
 
 
-def _to_machine(x: float, y: float) -> tuple[float, float]:
-    ax, bx, cx = CJ_TO_MACHINE[0]
-    ay, by, cy = CJ_TO_MACHINE[1]
+def _to_machine(x: float, y: float, affine) -> tuple[float, float]:
+    ax, bx, cx = affine[0]
+    ay, by, cy = affine[1]
     return ax * x + bx * y + cx, ay * x + by * y + cy
 
 
-def gerber_chambers(side: str = "front") -> list[dict]:
-    spec = SIDES[side]
-    if not spec["file"].is_file():
-        raise RuntimeError(f"缺少光绘文件 {spec['file']}")
-    flashes = _cj_flashes(spec["file"])
+def gerber_chambers(side: str, board: cfg.Board) -> list[dict]:
+    spec = board.side(side)
+    if not spec.gerber.is_file():
+        raise RuntimeError(f"缺少光绘文件 {spec.gerber}")
+    flashes = _cj_flashes(spec.gerber)
     horizontal = _dedupe(flashes["D49"])
     vertical_ap = _dedupe(flashes["D50"])
     if not vertical_ap:
-        raise RuntimeError(f"{spec['file'].name} 没有竖放电离室")
+        raise RuntimeError(f"{spec.gerber.name} 没有竖放电离室")
     bar_y = float(np.median([point[1] for point in vertical_ap]))
     vertical = [point for point in vertical_ap if abs(point[1] - bar_y) <= 2.0]
     short = [point for point in vertical_ap if abs(point[1] - bar_y) > 2.0]
@@ -113,9 +102,9 @@ def gerber_chambers(side: str = "front") -> list[dict]:
     )
     chambers = []
     for kind, (gx, gy) in items:
-        mx, my = _to_machine(gx, gy)
+        mx, my = _to_machine(gx, gy, board.gerber_to_machine)
         chambers.append({"kind": kind, "gx": round(gx, 3), "gy": round(gy, 3), "x": mx, "y": my})
-    if spec["mirror_y"]:
+    if spec.mirror_y:
         verticals = [chamber["y"] for chamber in chambers if chamber["kind"] == "vertical"]
         if not verticals:
             raise RuntimeError("底面没有竖放电离室，无法按这一列镜像")
@@ -129,17 +118,20 @@ def gerber_chambers(side: str = "front") -> list[dict]:
 
 
 def board_mm(mx: int, my: int, width: int, height: int, px: float, py: float) -> tuple[float, float]:
-    return mx + (py - height / 2) / PX_PER_MM, my + (px - width / 2) / PX_PER_MM
+    px_per_mm = cfg.machine().px_per_mm
+    return mx + (py - height / 2) / px_per_mm, my + (px - width / 2) / px_per_mm
 
 
-def detect(template: np.ndarray) -> list[dict]:
-    if DET_CACHE.is_file():
-        print(f"load {DET_CACHE.name}", flush=True)
-        return json.loads(DET_CACHE.read_text(encoding="utf-8"))
-    files = sorted(p for p in SCAN.glob("line_*.jpg") if POSE.search(p.stem))
+def detect(folder: Path, template: np.ndarray) -> list[dict]:
+    folder = Path(folder)
+    cache = folder / "detections.json"
+    if cache.is_file():
+        print(f"load {cache.name}", flush=True)
+        return json.loads(cache.read_text(encoding="utf-8"))
+    files = sorted(p for p in folder.glob("line_*.jpg") if POSE.search(p.stem))
     detections = []
     for index, path in enumerate(files, start=1):
-        mx, my = (int(v) for v in POSE.search(path.stem).groups())
+        mx, my = (int(float(v)) for v in POSE.search(path.stem).groups())
         image = ec._read(path)
         height, width = image.shape[:2]
         hits = ec.find_chambers(image, template, 0.5)
@@ -160,16 +152,16 @@ def detect(template: np.ndarray) -> list[dict]:
                 "bx": bx,
                 "by": by,
             })
-    DET_CACHE.write_text(json.dumps(detections), encoding="utf-8")
+    cache.write_text(json.dumps(detections), encoding="utf-8")
     return detections
 
 
-def cluster(detections: list[dict]) -> list[dict]:
+def cluster(detections: list[dict], merge_mm: float) -> list[dict]:
     detections = sorted(detections, key=lambda item: -item["score"])
     clusters: list[dict] = []
     for det in detections:
         chosen = None
-        nearest = MERGE_MM
+        nearest = merge_mm
         for group in clusters:
             distance = float(np.hypot(det["bx"] - group["x"], det["by"] - group["y"]))
             if distance < nearest:
@@ -184,8 +176,8 @@ def cluster(detections: list[dict]) -> list[dict]:
     return clusters
 
 
-def _column_centers(horizontals: list[dict]) -> list[float]:
-    theta = math.tan(math.radians(-2.027))
+def _column_centers(horizontals: list[dict], rotation_deg: float) -> list[float]:
+    theta = math.tan(math.radians(rotation_deg))
     bins: dict[int, list[float]] = {}
     for chamber in horizontals:
         straight = chamber["y"] - chamber["x"] * theta
@@ -194,22 +186,22 @@ def _column_centers(horizontals: list[dict]) -> list[float]:
     return [float(np.median(bins[key])) for key in sorted(bins)]
 
 
-def _column_index(x: float, y: float, centers: list[float]) -> int:
-    theta = math.tan(math.radians(-2.027))
+def _column_index(x: float, y: float, centers: list[float], rotation_deg: float) -> int:
+    theta = math.tan(math.radians(rotation_deg))
     straight = y - x * theta
     return min(range(len(centers)), key=lambda index: abs(straight - centers[index]))
 
 
-def _split_columns(horizontals: list[dict], clusters: list[dict], centers: list[float]):
+def _split_columns(horizontals: list[dict], clusters: list[dict], centers: list[float], rotation_deg: float):
     gerber_cols: dict[int, list[dict]] = {index: [] for index in range(len(centers))}
     found_cols: dict[int, list[dict]] = {index: [] for index in range(len(centers))}
     for chamber in horizontals:
-        gerber_cols[_column_index(chamber["x"], chamber["y"], centers)].append(chamber)
+        gerber_cols[_column_index(chamber["x"], chamber["y"], centers, rotation_deg)].append(chamber)
     for group in clusters:
         votes = sum(1 for view in group["views"] if view["vertical"])
         if votes * 2 >= len(group["views"]):
             continue
-        found_cols[_column_index(group["x"], group["y"], centers)].append(group)
+        found_cols[_column_index(group["x"], group["y"], centers, rotation_deg)].append(group)
     return gerber_cols, found_cols
 
 
@@ -228,11 +220,12 @@ def _equal_pairs(gerber_cols: dict[int, list[dict]], found_cols: dict[int, list[
     return src, dst
 
 
-def _align(chambers: list[dict], clusters: list[dict]) -> np.ndarray:
+def _align(chambers: list[dict], clusters: list[dict], board: cfg.Board) -> np.ndarray:
     """Shift by the columns whose counts already agree, then fit rotation. One column cannot see the angle."""
     horizontals = [chamber for chamber in chambers if chamber["kind"] == "horizontal"]
-    centers = _column_centers(horizontals)
-    gerber_cols, found_cols = _split_columns(horizontals, clusters, centers)
+    rotation = board.column_rotation_deg
+    centers = _column_centers(horizontals, rotation)
+    gerber_cols, found_cols = _split_columns(horizontals, clusters, centers, rotation)
     src, dst = _equal_pairs(gerber_cols, found_cols)
     if len(src) < 3:
         raise RuntimeError("照片和光绘对不上，没有写出编号")
@@ -243,7 +236,7 @@ def _align(chambers: list[dict], clusters: list[dict]) -> np.ndarray:
     for group in clusters:
         group["x"] += float(shift[0])
         group["y"] += float(shift[1])
-    gerber_cols, found_cols = _split_columns(horizontals, clusters, centers)
+    gerber_cols, found_cols = _split_columns(horizontals, clusters, centers, rotation)
     src, dst = _equal_pairs(gerber_cols, found_cols)
     matrix, _inliers = cv2.estimateAffinePartial2D(
         np.array(src, np.float32), np.array(dst, np.float32), method=cv2.RANSAC, ransacReprojThreshold=3,
@@ -302,8 +295,8 @@ def _match_bar(chambers: list[dict], clusters: list[dict]) -> dict[int, dict]:
     return assigned
 
 
-def match(chambers: list[dict], clusters: list[dict]) -> tuple[np.ndarray, dict, list[dict]]:
-    matrix = _align(chambers, clusters)
+def match(chambers: list[dict], clusters: list[dict], board: cfg.Board) -> tuple[np.ndarray, dict, list[dict]]:
+    matrix = _align(chambers, clusters, board)
     for group in clusters:
         gx, gy = _mapped(matrix, group["x"], group["y"])
         group["mx_gerber"] = gx
@@ -318,7 +311,7 @@ def match(chambers: list[dict], clusters: list[dict]) -> tuple[np.ndarray, dict,
             if chamber["kind"] == "vertical" or chamber["id"] in assigned:
                 continue
             distance = math.hypot(group["mx_gerber"] - chamber["x"], group["my_gerber"] - chamber["y"])
-            if distance <= MATCH_MM:
+            if distance <= board.match_mm:
                 pairs.append((distance, chamber["id"], group))
     pairs.sort(key=lambda item: item[0])
     used_chambers = set(assigned)
@@ -337,23 +330,20 @@ def view_out(view: dict) -> dict:
     return {key: view[key] for key in ("file", "mx", "my", "x", "y", "w", "h", "vertical", "score")}
 
 
-def group_scan(folder: Path | None = None, side: str | None = None) -> dict:
-    """Match one scan folder to the xbeam Gerber ids. The motor offset is measured from the photos."""
-    global SCAN, OUT, DET_CACHE
-    if folder is not None:
-        SCAN = Path(folder)
-        OUT = SCAN / "groups.json"
-        DET_CACHE = SCAN / "detections.json"
-    side = side or (read_side(SCAN) if folder is not None else "front")
-    spec = SIDES[side]
-    chambers = gerber_chambers(side)
+def group_scan(folder: Path | None = None, side: str | None = None, board_id: str | None = None) -> dict:
+    """Match one scan folder to the board's Gerber ids. The motor offset is measured from the photos."""
+    scan = Path(folder) if folder is not None else SCAN
+    board = cfg.board(board_id) if board_id else (read_board(scan) if folder is not None else cfg.board())
+    side = side or read_side(scan, board)
+    spec = board.side(side)
+    chambers = gerber_chambers(side, board)
     counts = {kind: sum(1 for chamber in chambers if chamber["kind"] == kind) for kind in ("horizontal", "vertical", "short")}
-    print(f"gerber {side} {len(chambers)} {counts}", flush=True)
-    if len(chambers) != spec["expect"]:
-        raise RuntimeError(f"xbeam {'背面' if side == 'back' else '正面'}应有 {spec['expect']} 颗，读到 {len(chambers)}")
-    detections = detect(ec.load_template())
-    groups = cluster(detections)
-    matrix, assigned, unmatched = match(chambers, groups)
+    print(f"gerber {board.id} {side} {len(chambers)} {counts}", flush=True)
+    if len(chambers) != spec.expect:
+        raise RuntimeError(f"{board.id} {'背面' if side == 'back' else '正面'}应有 {spec.expect} 颗，读到 {len(chambers)}")
+    detections = detect(scan, ec.load_template())
+    groups = cluster(detections, board.merge_mm)
+    matrix, assigned, unmatched = match(chambers, groups, board)
     rows = []
     missing = []
     for chamber in chambers:
@@ -381,14 +371,18 @@ def group_scan(folder: Path | None = None, side: str | None = None) -> dict:
             "files": sorted({view["file"] for view in group["views"]}),
         })
     errors = [row["error_mm"] for row in rows if "error_mm" in row]
+    try:
+        source = scan.relative_to(ROOT).as_posix()
+    except ValueError:
+        source = str(scan)
     payload = {
-        "source": SCAN.relative_to(ROOT).as_posix(),
-        "photos": len(list(SCAN.glob("line_*.jpg"))),
+        "source": source,
+        "photos": len(list(scan.glob("line_*.jpg"))),
         "detections": len(detections),
         "clusters": len(groups),
-        "board": "xbeam",
+        "board": board.id,
         "side": side,
-        "gerber": spec["expect"],
+        "gerber": spec.expect,
         "matched": len(assigned),
         "missing": len(missing),
         "extras": len(extras),
@@ -404,7 +398,8 @@ def group_scan(folder: Path | None = None, side: str | None = None) -> dict:
         "missing_list": missing,
         "extra_list": extras,
     }
-    OUT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    out = scan / "groups.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     by_kind = {}
     for row in rows:
         by_kind.setdefault(row["kind"], [0, 0])
@@ -413,19 +408,23 @@ def group_scan(folder: Path | None = None, side: str | None = None) -> dict:
             by_kind[row["kind"]][0] += 1
     multi = sum(1 for row in rows if len(row["views"]) > 1)
     print(
-        f"detections {len(detections)} clusters {len(groups)} matched {len(assigned)}/{spec['expect']} "
+        f"detections {len(detections)} clusters {len(groups)} matched {len(assigned)}/{spec.expect} "
         f"missing {len(missing)} extras {len(extras)} multi {multi} "
         f"align {payload['align']} median {payload['median_error_mm']} p90 {payload['p90_error_mm']}",
         flush=True,
     )
     print("by kind found/total", by_kind, flush=True)
-    print("wrote", OUT, flush=True)
+    print("wrote", out, flush=True)
     return payload
 
 
 def main() -> None:
-    folder = Path(sys.argv[1]) if len(sys.argv) > 1 else None
-    group_scan(folder)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("folder", nargs="?", help="scan folder; defaults to qc_motion/scan_line")
+    parser.add_argument("--board", help="board id; defaults to the folder's board.txt")
+    parser.add_argument("--side", choices=("front", "back"), help="board side; defaults to side.txt")
+    args = parser.parse_args()
+    group_scan(Path(args.folder) if args.folder else None, args.side, args.board)
 
 
 if __name__ == "__main__":
