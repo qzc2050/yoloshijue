@@ -18,237 +18,31 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import export_chamber_crops as ec
+import project_config as cfg
 
-PX_PER_MM = 44.2
-MERGE_MM = 2.5
-ROW_MM = 3.0
-CACHE = Path(r"E:\yolo\runs\board_view_index.json")
-POSE = re.compile(r"_x(-?\d+)_y(-?\d+)$")
-
-
-def scan_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "qc_motion" / "scan"
+MACHINE = cfg.machine()
+PX_PER_MM = MACHINE.px_per_mm
+MERGE_MM = cfg.active_board().merge_mm
+SCAN_YOLO = MACHINE.scan_root
+KIND_NAME = {"horizontal": "横放", "vertical": "竖放", "short": "短的"}
+KIND_COLOR = {"horizontal": "#e53935", "vertical": "#1e88e5", "short": "#43a047"}
+LABEL_COLOR = {"hege": "#2e7d32", "shenmo": "#c62828", "quemo": "#f9a825", "kanbuqing": "#e65100", "mixed": "#6a1b9a"}
+LABEL_NAME = {"hege": "合格", "shenmo": "渗墨", "quemo": "缺墨", "kanbuqing": "看不清", "mixed": "多种"}
+VERDICT_COLOR = {"hege": "#2e7d32", "shenmo": "#c62828", "quemo": "#f9a825", "kanbuqing": "#e65100", "unsure": "#8e24aa"}
+UNSURE = MACHINE.unsure_conf
+POSE = re.compile(r"_x(-?\d+(?:\.\d+)?)_y(-?\d+(?:\.\d+)?)$")
 
 
 def _pose(path: Path) -> tuple[int, int] | None:
     match = POSE.search(path.stem)
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2))
+    return int(float(match.group(1))), int(float(match.group(2)))
 
 
 def _board_mm(mx: int, my: int, width: int, height: int, px: float, py: float) -> tuple[float, float]:
     """The scene moves up when the camera moves X+ and left when it moves Y+."""
     return mx + (py - height / 2) / PX_PER_MM, my + (px - width / 2) / PX_PER_MM
-
-
-def build_index(folder: Path, template: np.ndarray, threshold: float = 0.5) -> dict:
-    files = sorted(p for p in folder.glob("scan_*.jpg") if _pose(p))
-    detections = []
-    for path in files:
-        pose = _pose(path)
-        image = ec._read(path)
-        if image is None or pose is None:
-            continue
-        height, width = image.shape[:2]
-        mx, my = pose
-        for hit in ec.find_chambers(image, template, threshold):
-            cx, cy = hit.center
-            bx, by = _board_mm(mx, my, width, height, cx, cy)
-            detections.append({
-                "file": str(path),
-                "mx": mx,
-                "my": my,
-                "x": int(hit.x),
-                "y": int(hit.y),
-                "w": int(hit.w),
-                "h": int(hit.h),
-                "vertical": bool(hit.vertical),
-                "score": round(float(hit.score), 3),
-                "bx": bx,
-                "by": by,
-            })
-    detections.sort(key=lambda item: -item["score"])
-    clusters: list[dict] = []
-    for det in detections:
-        chosen = None
-        nearest = MERGE_MM
-        for cluster in clusters:
-            distance = float(np.hypot(det["bx"] - cluster["x"], det["by"] - cluster["y"]))
-            if distance < nearest:
-                nearest = distance
-                chosen = cluster
-        if chosen is None:
-            clusters.append({"x": det["bx"], "y": det["by"], "n": 1, "views": [det]})
-            continue
-        chosen["views"].append(det)
-        chosen["n"] += 1
-        chosen["x"] = sum(view["bx"] for view in chosen["views"]) / chosen["n"]
-        chosen["y"] = sum(view["by"] for view in chosen["views"]) / chosen["n"]
-    clusters.sort(key=lambda cluster: (round(cluster["x"] / ROW_MM), cluster["y"]))
-    chambers = []
-    for number, cluster in enumerate(clusters, start=1):
-        views = sorted(cluster["views"], key=lambda view: -view["score"])
-        for view in views:
-            view.pop("bx", None)
-            view.pop("by", None)
-        chambers.append({
-            "id": number,
-            "x": round(cluster["x"], 1),
-            "y": round(cluster["y"], 1),
-            "views": views,
-        })
-    return {"px_per_mm": PX_PER_MM, "merge_mm": MERGE_MM, "chambers": chambers}
-
-
-def load_index() -> dict | None:
-    if not CACHE.is_file():
-        return None
-    return json.loads(CACHE.read_text(encoding="utf-8"))
-
-
-def save_index(data: dict) -> None:
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-
-
-class BoardViewPanel(ttk.Frame):
-    """List chambers numbered from the motor origin, and every photo of the selected one."""
-
-    def __init__(self, master) -> None:
-        super().__init__(master)
-        self.template = ec.load_template()
-        self.data: dict | None = None
-        self._photos: list[ImageTk.PhotoImage] = []
-        self._busy = False
-
-        guide = ttk.Label(
-            self,
-            text="从电机 0、0 起给电离室编号。点左边的编号，右边列出这颗在哪几张扫描照片里，每张是一个拍摄位置。",
-            background="#eef4fb",
-            padding=8,
-            justify="left",
-        )
-        guide.pack(fill="x")
-
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=4)
-        ttk.Button(bar, text="从扫描照片建立编号", command=self._start).pack(side="left")
-        self.status = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.status).pack(side="left", padx=8)
-
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=8, pady=4)
-        left = ttk.Frame(body, width=360)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
-        columns = ("id", "x", "y", "n")
-        self.tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("id", text="编号")
-        self.tree.heading("x", text="X mm")
-        self.tree.heading("y", text="Y mm")
-        self.tree.heading("n", text="张数")
-        self.tree.column("id", width=60, anchor="e")
-        self.tree.column("x", width=80, anchor="e")
-        self.tree.column("y", width=80, anchor="e")
-        self.tree.column("n", width=50, anchor="e")
-        scroll = ttk.Scrollbar(left, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="left", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_selected())
-
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self.canvas = tk.Canvas(right, bg="#1e1e1e", highlightthickness=0)
-        hbar = ttk.Scrollbar(right, orient="horizontal", command=self.canvas.xview)
-        self.canvas.configure(xscrollcommand=hbar.set)
-        self.canvas.pack(fill="both", expand=True)
-        hbar.pack(fill="x")
-        self.view_row = ttk.Frame(self.canvas)
-        self.canvas.create_window((0, 0), window=self.view_row, anchor="nw")
-        self.view_row.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-
-        cached = load_index()
-        if cached:
-            self._fill(cached)
-        else:
-            self.status.set(f"还没有编号。扫描照片在 {scan_dir()}")
-
-    def _start(self) -> None:
-        if self._busy:
-            return
-        folder = scan_dir()
-        if not folder.is_dir():
-            self.status.set(f"找不到扫描照片：{folder}")
-            return
-        self._busy = True
-        self.status.set("正在逐张找电离室，大约需要半分钟…")
-
-        def work() -> None:
-            try:
-                data = build_index(folder, self.template)
-                save_index(data)
-                self.after(0, lambda: self._fill(data))
-            except Exception as exc:
-                message = str(exc)
-                self.after(0, lambda message=message: self.status.set(f"建立失败：{message}"))
-            finally:
-                self._busy = False
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _fill(self, data: dict) -> None:
-        self.data = data
-        self.tree.delete(*self.tree.get_children())
-        for chamber in data["chambers"]:
-            self.tree.insert("", "end", iid=str(chamber["id"]), values=(
-                chamber["id"], f"{chamber['x']:.1f}", f"{chamber['y']:.1f}", len(chamber["views"]),
-            ))
-        multi = sum(1 for chamber in data["chambers"] if len(chamber["views"]) > 1)
-        self.status.set(f"共 {len(data['chambers'])} 颗，其中 {multi} 颗出现在多张照片里。点编号查看。")
-        if data["chambers"]:
-            self.tree.selection_set("1")
-            self.tree.focus("1")
-            self._show_selected()
-
-    def _show_selected(self) -> None:
-        for child in self.view_row.winfo_children():
-            child.destroy()
-        self._photos.clear()
-        if not self.data:
-            return
-        selected = self.tree.selection()
-        if not selected:
-            return
-        chamber = next(item for item in self.data["chambers"] if item["id"] == int(selected[0]))
-        for view in chamber["views"]:
-            image = ec._read(Path(view["file"]))
-            if image is None:
-                continue
-            hit = ec.Hit(view["score"], view["vertical"], view["x"], view["y"], view["w"], view["h"])
-            crop = ec.crop_chamber(image, hit)
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            picture = Image.fromarray(rgb)
-            picture.thumbnail((320, 240))
-            photo = ImageTk.PhotoImage(picture)
-            self._photos.append(photo)
-            card = ttk.Frame(self.view_row)
-            card.pack(side="left", padx=6, pady=6)
-            ttk.Label(card, image=photo).pack()
-            name = Path(view["file"]).name
-            ttk.Label(card, text=f"电机 {view['mx']} , {view['my']}\n{name}\n匹配 {view['score']:.2f}").pack()
-        self.canvas.xview_moveto(0)
-
-
-SCAN_YOLO = Path(__file__).resolve().parents[2] / "qc_motion" / "scan_yolo"
-KIND_NAME = {"horizontal": "横放", "vertical": "竖放", "short": "短的"}
-KIND_COLOR = {"horizontal": "#e53935", "vertical": "#1e88e5", "short": "#43a047"}
-LABEL_COLOR = {"hege": "#2e7d32", "shenmo": "#c62828", "quemo": "#f9a825", "kanbuqing": "#e65100", "mixed": "#6a1b9a"}
-LABEL_NAME = {"hege": "合格", "shenmo": "渗墨", "quemo": "缺墨", "kanbuqing": "看不清", "mixed": "多种"}
-VERDICT_COLOR = {"hege": "#2e7d32", "shenmo": "#c62828", "quemo": "#f9a825", "kanbuqing": "#e65100", "unsure": "#8e24aa"}
-UNSURE = 0.6
-BOARD_ROTATION_DEG = -2.027
 
 
 def _verdict_key(name: str, conf: float) -> str:
@@ -330,13 +124,6 @@ def classify_chambers(folder: Path, chambers: list[dict], on_progress=None) -> d
     return results
 
 
-def _rotation_for(side: str) -> float:
-    """Front columns lean one way. Mirroring Y for the back flip reverses that lean."""
-    if side == "back":
-        return -BOARD_ROTATION_DEG
-    return BOARD_ROTATION_DEG
-
-
 def _upright_point(machine_x: float, machine_y: float, origin_x: float, origin_y: float, rotation_deg: float) -> tuple[float, float]:
     """Take off the machine rotation so the five columns stand vertical."""
     phi = math.radians(-rotation_deg)
@@ -345,13 +132,13 @@ def _upright_point(machine_x: float, machine_y: float, origin_x: float, origin_y
     return origin_x + cosine * dx - sine * dy, origin_y + sine * dx + cosine * dy
 
 
-def assign_display_numbers(chambers: list[dict], side: str = "front") -> list[dict]:
+def assign_display_numbers(chambers: list[dict], rotation_deg: float) -> list[dict]:
     """Five horizontal columns top to bottom, then shorts, then the vertical bar left to right."""
     if not chambers:
         return []
     origin_x = sum(chamber["x"] for chamber in chambers) / len(chambers)
     origin_y = sum(chamber["y"] for chamber in chambers) / len(chambers)
-    rotation = _rotation_for(side)
+    rotation = rotation_deg
     horizontals: list[dict] = []
     shorts: list[dict] = []
     verticals: list[dict] = []
@@ -393,17 +180,27 @@ def _group_module():
     return group_line
 
 
-def _scan_folders() -> list[Path]:
+def folder_board_id(folder: Path) -> str:
+    """Scans written before board.txt existed belong to the active board."""
+    path = Path(folder) / "board.txt"
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip().lower()
+    return cfg.machine().active_board
+
+
+def _scan_folders(board_id: str | None = None) -> list[Path]:
     """Newest photo folder first, whether the name is beamcheck or pathcheck."""
     if not SCAN_YOLO.is_dir():
         return []
     folders = [path for path in SCAN_YOLO.iterdir() if path.is_dir() and any(path.glob("line_*.jpg"))]
+    if board_id:
+        folders = [path for path in folders if folder_board_id(path) == board_id]
     folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return folders
 
 
-def latest_grouped_scan() -> tuple[Path, dict] | None:
-    grouped = [path for path in _scan_folders() if (path / "groups.json").is_file()]
+def latest_grouped_scan(board_id: str | None = None) -> tuple[Path, dict] | None:
+    grouped = [path for path in _scan_folders(board_id) if (path / "groups.json").is_file()]
     if not grouped:
         return None
     folder = grouped[0]
@@ -436,10 +233,11 @@ def _bind_mouse_watch(widget: tk.Misc) -> None:
 class GerberBoardPanel(ttk.Frame):
     """Show the 399 Gerber ids for one scan. The motor offset is measured again each time."""
 
-    def __init__(self, master, embedded: bool = False) -> None:
+    def __init__(self, master, embedded: bool = False, board_id: str | None = None) -> None:
         super().__init__(master)
         _bind_mouse_watch(self)
         self.embedded = embedded
+        self.board = cfg.board(board_id)
         self.folder: Path | None = None
         self.data: dict | None = None
         self.labels: dict[int, str] = {}
@@ -538,14 +336,14 @@ class GerberBoardPanel(ttk.Frame):
         self.canvas.create_window((0, 0), window=self.view_row, anchor="nw")
         self.view_row.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
-        cached = latest_grouped_scan()
+        cached = latest_grouped_scan(self.board.id)
         if cached:
             self.show(*cached)
         else:
             self.status.set("还没有识别结果。扫完整板后这里会按所选板面列出。")
 
     def _identify_latest(self) -> None:
-        folders = _scan_folders()
+        folders = _scan_folders(self.board.id)
         if not folders:
             self.status.set("还没有扫描文件夹。")
             return
@@ -588,6 +386,7 @@ class GerberBoardPanel(ttk.Frame):
     def show(self, folder: Path, payload: dict) -> None:
         self.folder = folder
         self.data = payload
+        self.board = cfg.board(payload.get("board") or self.board.id)
         self.verdicts = load_verdicts(folder)
         self._shown_n = None
         self._thumbs_ready = False
@@ -686,12 +485,15 @@ class GerberBoardPanel(ttk.Frame):
 
     def _assign_numbers(self) -> list[dict]:
         """Five horizontal columns top to bottom, then shorts, then the vertical bar left to right."""
-        return assign_display_numbers(self.data["chambers"], self.data.get("side", "front"))
+        side = self.data.get("side", "front")
+        return assign_display_numbers(self.data["chambers"], self.board.side(side).rotation_deg)
 
     def _upright(self, machine_x: float, machine_y: float) -> tuple[float, float]:
         """Take off the machine rotation so the five columns stand vertical."""
         side = (self.data or {}).get("side", "front")
-        return _upright_point(machine_x, machine_y, self._origin_x, self._origin_y, _rotation_for(side))
+        return _upright_point(
+            machine_x, machine_y, self._origin_x, self._origin_y, self.board.side(side).rotation_deg,
+        )
 
     def _plot_box(self) -> tuple[float, float, float, float, float, float, float, float] | None:
         if not self.data:
@@ -1096,7 +898,8 @@ class GerberBoardPanel(ttk.Frame):
 
 
 def _view_labels(payload: dict) -> dict[tuple[str, int, int], tuple[int, str]]:
-    assign_display_numbers(payload["chambers"], payload.get("side", "front"))
+    board = cfg.board(payload.get("board"))
+    assign_display_numbers(payload["chambers"], board.side(payload.get("side", "front")).rotation_deg)
     labels = {}
     for chamber in payload["chambers"]:
         kind = KIND_NAME.get(chamber["kind"], chamber["kind"])
