@@ -1,0 +1,11 @@
+{
+  "note": "machine_mm = scale * R(rotation_deg) @ [-gerber_y, gerber_x] + offset; TOP side up, origin at the board corner by the left motor",
+  "scale": 1.00101,
+  "rotation_deg": -2.027,
+  "offset_mm": [
+    -17.394,
+    387.608
+  ],
+  "median_error_mm": 0.99,
+  "p90_error_mm": 1.32
+}

@@ -1,0 +1,52 @@
+# Python
+.venv/
+.venv-32bit-backup/
+__pycache__/
+*.py[cod]
+
+# Build output
+build/
+dist/
+*.egg-info/
+图片识别上位机/pdf_smoke_test_annotated.png
+
+# Debug images
+图片识别上位机/dbg_*.png
+图片识别上位机/debug_*.png
+图片识别上位机/*_overlay_preview.jpg
+
+# Scan photos and per-scan results (kept on the machine, not in git)
+qc_motion/scan/
+qc_motion/scan40/
+qc_motion/scan40_stall/
+qc_motion/scan_line/
+qc_motion/scan_yolo/
+
+# Captured / sample images
+图片识别上位机/captured/
+图片识别上位机/samples/
+图片识别上位机/new-zhijian/captured/
+
+# Firmware build products
+qc_motion/MDK-ARM/Output/
+qc_motion/MDK-ARM/List/
+qc_motion/MDK-ARM/DebugConfig/
+qc_motion/MDK-ARM/RTE/
+
+# as600 has its own git repository and remote
+as600/
+
+# Installers and archives
+*.exe
+*.zip
+MVS_STD_*
+
+# Editor / tooling
+.vscode/
+.commandcode/
+.idea/
+*.uvguix.*
+
+# OS
+Thumbs.db
+desktop.ini
